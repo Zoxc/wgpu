@@ -448,6 +448,13 @@ impl super::Adapter {
             supported((3, 1), (4, 2)) || extensions.contains("GL_ARB_shader_image_load_store"),
         );
         features.set(wgt::Features::SHADER_UNUSED_VERTEX_OUTPUT, true);
+        if extensions.contains("GL_ARB_timer_query")
+            && (extensions.contains("GL_ARB_query_buffer_object")
+                || extensions.contains("GL_AMD_query_buffer_object"))
+        {
+            features.set(wgt::Features::TIMESTAMP_QUERY, true);
+            features.set(wgt::Features::TIMESTAMP_QUERY_INSIDE_PASSES, true);
+        }
         let gles_bcn_exts = [
             "GL_EXT_texture_compression_s3tc_srgb",
             "GL_EXT_texture_compression_rgtc",
@@ -538,7 +545,10 @@ impl super::Adapter {
         );
         private_caps.set(
             super::PrivateCapabilities::GET_BUFFER_SUB_DATA,
-            cfg!(target_arch = "wasm32"),
+            cfg!(target_arch = "wasm32")
+                || full_ver
+                    .map(|full_ver| full_ver >= (2, 0))
+                    .unwrap_or_default(),
         );
         let color_buffer_float = extensions.contains("GL_EXT_color_buffer_float")
             || extensions.contains("EXT_color_buffer_float");

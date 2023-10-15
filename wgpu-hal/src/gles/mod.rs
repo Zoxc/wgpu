@@ -775,6 +775,7 @@ enum Command {
     SetIndexBuffer(glow::Buffer),
     BeginQuery(glow::Query, BindTarget),
     EndQuery(BindTarget),
+    TimestampQuery(glow::Query),
     CopyQueryResults {
         query_range: Range<u32>,
         dst: Buffer,
