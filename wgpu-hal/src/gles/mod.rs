@@ -161,6 +161,12 @@ bitflags::bitflags! {
         const COLOR_BUFFER_FLOAT = 1 << 9;
         /// Supports linear flitering `f32` textures.
         const TEXTURE_FLOAT_LINEAR = 1 << 10;
+        /// Supports `glTexStorage2D`, etc.
+        const TEXTURE_STORAGE = 1 << 11;
+        /// Supports `push_debug_group`, `pop_debug_group` and `debug_message_insert`.
+        const DEBUG_GROUPS = 1 << 12;
+        /// Color clears does sRGB conversions.
+        const CLEAR_SRGB = 1 << 13;
     }
 }
 

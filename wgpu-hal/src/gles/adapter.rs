@@ -15,7 +15,7 @@ impl super::Adapter {
     /// resulting in an `Err`.
     /// # Notes
     /// `WebGL 2` version returned as `OpenGL ES 3.0`
-    fn parse_version(mut src: &str) -> Result<(u8, u8), crate::InstanceError> {
+    fn parse_version(mut src: &str) -> Result<((u8, u8), bool), crate::InstanceError> {
         let webgl_sig = "WebGL ";
         // According to the WebGL specification
         // VERSION  WebGL<space>1.0<space><vendor-specific information>
@@ -50,12 +50,15 @@ impl super::Adapter {
         Self::parse_full_version(src).map(|(major, minor)| {
             (
                 // Return WebGL 2.0 version as OpenGL ES 3.0
-                if is_webgl && !is_glsl {
-                    major + 1
-                } else {
-                    major
-                },
-                minor,
+                (
+                    if is_webgl && !is_glsl {
+                        major + 1
+                    } else {
+                        major
+                    },
+                    minor,
+                ),
+                is_webgl,
             )
         })
     }
@@ -222,10 +225,27 @@ impl super::Adapter {
         log::info!("Version: {}", version);
 
         let full_ver = Self::parse_full_version(&version).ok();
-        let es_ver = full_ver
+        let es_ver_web_gl = full_ver
             .is_none()
             .then_some(())
             .and_then(|_| Self::parse_version(&version).ok());
+        let es_ver = es_ver_web_gl.map(|(v, _)| v);
+        let web_gl = es_ver_web_gl.map(|(_, w)| w).unwrap_or_default();
+
+        let core_profile = full_ver
+            .map(|v| {
+                if v > (3, 2) {
+                    unsafe {
+                        gl.get_parameter_i32(glow::CONTEXT_PROFILE_MASK)
+                            & glow::CONTEXT_CORE_PROFILE_BIT as i32
+                            != 0
+                    }
+                } else {
+                    false
+                }
+            })
+            .unwrap_or_default();
+        log::info!("OpenGL Core Profile {core_profile:?}");
 
         if es_ver.is_none() && full_ver.is_none() {
             log::warn!("Unable to parse OpenGL version");
@@ -244,9 +264,9 @@ impl super::Adapter {
         }
 
         if let Some(full_ver) = full_ver {
-            if full_ver < (3, 3) {
+            if full_ver < (3, 1) {
                 log::warn!(
-                    "Returned GL context is {}.{}, when 3.3+ is needed",
+                    "Returned GL context is {}.{}, when 3.1+ is needed",
                     full_ver.0,
                     full_ver.1
                 );
@@ -284,7 +304,7 @@ impl super::Adapter {
                 }
                 naga::back::glsl::Version::Desktop(value)
             } else {
-                let (sl_major, sl_minor) = Self::parse_version(&sl_version).ok()?;
+                let (sl_major, sl_minor) = Self::parse_version(&sl_version).ok().map(|(v, _)| v)?;
                 let value = sl_major as u16 * 100 + sl_minor as u16 * 10;
                 naga::back::glsl::Version::Embedded {
                     version: value,
@@ -564,6 +584,21 @@ impl super::Adapter {
         private_caps.set(
             super::PrivateCapabilities::TEXTURE_FLOAT_LINEAR,
             extensions.contains("OES_texture_float_linear"),
+        );
+        private_caps.set(
+            super::PrivateCapabilities::TEXTURE_STORAGE,
+            supported((3, 0), (4, 2)),
+        );
+        private_caps.set(
+            super::PrivateCapabilities::DEBUG_GROUPS,
+            supported((3, 2), (4, 3)) && !web_gl,
+        );
+        private_caps.set(
+            super::PrivateCapabilities::CLEAR_SRGB,
+            full_ver
+                .map(|v| v >= (4, 2) && core_profile)
+                .unwrap_or_default()
+                || es_ver.is_some(),
         );
 
         let max_texture_size = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as u32;
@@ -1149,24 +1184,30 @@ mod tests {
         Adapter::parse_version("1. h3l1o. W0rld").unwrap_err();
         Adapter::parse_version("1.2.3").unwrap_err();
 
-        assert_eq!(Adapter::parse_version("OpenGL ES 3.1").unwrap(), (3, 1));
+        assert_eq!(
+            Adapter::parse_version("OpenGL ES 3.1").unwrap(),
+            ((3, 1), false)
+        );
         assert_eq!(
             Adapter::parse_version("OpenGL ES 2.0 Google Nexus").unwrap(),
-            (2, 0)
+            ((2, 0), false)
         );
-        assert_eq!(Adapter::parse_version("GLSL ES 1.1").unwrap(), (1, 1));
+        assert_eq!(
+            Adapter::parse_version("GLSL ES 1.1").unwrap(),
+            ((1, 1), false)
+        );
         assert_eq!(
             Adapter::parse_version("OpenGL ES GLSL ES 3.20").unwrap(),
-            (3, 2)
+            ((3, 2), false)
         );
         assert_eq!(
             // WebGL 2.0 should parse as OpenGL ES 3.0
             Adapter::parse_version("WebGL 2.0 (OpenGL ES 3.0 Chromium)").unwrap(),
-            (3, 0)
+            ((3, 0), true)
         );
         assert_eq!(
             Adapter::parse_version("WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)").unwrap(),
-            (3, 0)
+            ((3, 0), true)
         );
     }
 }

@@ -9,6 +9,7 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::{
     collections::HashSet,
     ffi::{c_void, CStr, CString},
+    fmt,
     io::Error,
     mem,
     os::raw::c_int,
@@ -137,6 +138,12 @@ struct Inner {
     gl: glow::Context,
     device: HDC,
     context: WglContext,
+}
+
+impl fmt::Debug for Inner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Inner").finish()
+    }
 }
 
 pub struct Instance {
@@ -475,13 +482,20 @@ impl Drop for DeviceContextHandle {
     }
 }
 
+pub struct SurfaceContext {
+    wgl_context: WglContext,
+    gl: glow::Context,
+}
+
 pub struct Swapchain {
-    surface_context: WglContext,
-    surface_gl: glow::Context,
+    // Separate surface context used if the global context can't be used on this surface.
+    surface_context: Option<SurfaceContext>,
     framebuffer: glow::Framebuffer,
     renderbuffer: glow::Renderbuffer,
+
     /// Extent because the window lies
     extent: wgt::Extent3d,
+
     format: wgt::TextureFormat,
     format_desc: super::TextureFormatDesc,
     #[allow(unused)]
@@ -520,35 +534,82 @@ impl Surface {
             window: self.window,
         };
 
-        // Hold the lock for the shared context as we're using resources from there.
-        let _inner = context.inner.lock();
+        if let Some(surface_context) = &sc.surface_context {
+            // Hold the lock for the shared context as we're using resources from there.
+            let _inner = context.inner.lock();
 
-        if let Err(e) = sc.surface_context.make_current(dc.device) {
-            log::error!("unable to make the surface OpenGL context current: {e}",);
-            return Err(crate::SurfaceError::Other(
-                "unable to make the surface OpenGL context current",
-            ));
+            if let Err(e) = surface_context.wgl_context.make_current(dc.device) {
+                log::error!("unable to make the surface OpenGL context current: {e}",);
+                return Err(crate::SurfaceError::Other(
+                    "unable to make the surface OpenGL context current",
+                ));
+            }
+
+            unsafe { surface_context.gl.disable(glow::FRAMEBUFFER_SRGB) };
+
+            // Note the Y-flipping here. GL's presentation is not flipped,
+            // but main rendering is. Therefore, we Y-flip the output positions
+            // in the shader, and also this blit.
+            unsafe {
+                surface_context.gl.blit_framebuffer(
+                    0,
+                    sc.extent.height as i32,
+                    sc.extent.width as i32,
+                    0,
+                    0,
+                    0,
+                    sc.extent.width as i32,
+                    sc.extent.height as i32,
+                    glow::COLOR_BUFFER_BIT,
+                    glow::NEAREST,
+                )
+            };
+
+            unsafe { surface_context.gl.enable(glow::FRAMEBUFFER_SRGB) };
+        } else {
+            let inner = context.inner.lock();
+
+            if let Err(e) = inner.context.make_current(dc.device) {
+                log::error!("unable to make the shared OpenGL context current for surface: {e}",);
+                return Err(crate::SurfaceError::Other(
+                    "unable to make the shared OpenGL context current for surface",
+                ));
+            }
+
+            let gl = &inner.gl;
+            /*
+                    gl.draw_buffer(glow::FRONT_AND_BACK);
+                    gl.clear_color(1.0, 0.5, 0.2, 1.0);
+                    gl.clear(glow::COLOR_BUFFER_BIT);
+            */
+            unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
+            unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(sc.framebuffer)) };
+
+            unsafe { gl.disable(glow::FRAMEBUFFER_SRGB) };
+
+            // Note the Y-flipping here. GL's presentation is not flipped,
+            // but main rendering is. Therefore, we Y-flip the output positions
+            // in the shader, and also this blit.
+            unsafe {
+                gl.blit_framebuffer(
+                    0,
+                    sc.extent.height as i32,
+                    sc.extent.width as i32,
+                    0,
+                    0,
+                    0,
+                    sc.extent.width as i32,
+                    sc.extent.height as i32,
+                    glow::COLOR_BUFFER_BIT,
+                    glow::NEAREST,
+                )
+            };
+
+            unsafe { gl.enable(glow::FRAMEBUFFER_SRGB) };
+
+            unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, None) };
+            unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
         }
-
-        let gl = &sc.surface_gl;
-
-        // Note the Y-flipping here. GL's presentation is not flipped,
-        // but main rendering is. Therefore, we Y-flip the output positions
-        // in the shader, and also this blit.
-        unsafe {
-            gl.blit_framebuffer(
-                0,
-                sc.extent.height as i32,
-                sc.extent.width as i32,
-                0,
-                0,
-                0,
-                sc.extent.width as i32,
-                sc.extent.height as i32,
-                glow::COLOR_BUFFER_BIT,
-                glow::NEAREST,
-            )
-        };
 
         if unsafe { SwapBuffers(dc.device) } == FALSE {
             log::error!("unable to swap buffers: {}", Error::last_os_error());
@@ -572,33 +633,6 @@ impl crate::Surface<super::Api> for Surface {
         // Remove the old configuration.
         unsafe { self.unconfigure(device) };
 
-        let format_desc = device.shared.describe_texture_format(config.format);
-        let inner = &device.shared.context.inner.lock();
-
-        if let Err(e) = inner.context.make_current(inner.device) {
-            log::error!("unable to make the shared OpenGL context current: {e}",);
-            return Err(crate::SurfaceError::Other(
-                "unable to make the shared OpenGL context current",
-            ));
-        }
-
-        let gl = &inner.gl;
-        let renderbuffer = unsafe { gl.create_renderbuffer() }.map_err(|error| {
-            log::error!("Internal swapchain renderbuffer creation failed: {error}");
-            crate::DeviceError::OutOfMemory
-        })?;
-        unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, Some(renderbuffer)) };
-        unsafe {
-            gl.renderbuffer_storage(
-                glow::RENDERBUFFER,
-                format_desc.internal,
-                config.extent.width as _,
-                config.extent.height as _,
-            )
-        };
-
-        // Create the swap chain OpenGL context
-
         let dc = unsafe { GetDC(self.window) };
         if dc.is_null() {
             log::error!(
@@ -621,35 +655,161 @@ impl crate::Surface<super::Api> for Surface {
             ));
         }
 
-        let context = unsafe { wglCreateContext(dc.device) };
-        if context.is_null() {
-            log::error!(
-                "unable to create surface OpenGL context: {}",
-                Error::last_os_error()
-            );
-            return Err(crate::SurfaceError::Other(
-                "unable to create surface OpenGL context",
-            ));
-        }
-        let surface_context = WglContext { context };
+        let format_desc = device.shared.describe_texture_format(config.format);
+        let inner = &device.shared.context.inner.lock();
 
-        if unsafe { wglShareLists(inner.context.context, surface_context.context) } == FALSE {
-            log::error!(
-                "unable to share objects between OpenGL contexts: {}",
-                Error::last_os_error()
-            );
-            return Err(crate::SurfaceError::Other(
-                "unable to share objects between OpenGL contexts",
-            ));
-        }
+        let can_share_context = inner.context.make_current(dc.device);
+        dbg!(&can_share_context);
+        //let can_share_context: Result<(), ()> = Err(());
+        let (framebuffer, renderbuffer, surface_context) = if can_share_context.is_ok() {
+            let gl = &inner.gl;
+            let renderbuffer = unsafe { gl.create_renderbuffer() }.map_err(|error| {
+                log::error!("Internal swapchain renderbuffer creation failed: {error}");
+                crate::DeviceError::OutOfMemory
+            })?;
+            unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, Some(renderbuffer)) };
+            unsafe {
+                gl.renderbuffer_storage(
+                    glow::RENDERBUFFER,
+                    format_desc.internal,
+                    config.extent.width as _,
+                    config.extent.height as _,
+                )
+            };
 
-        if let Err(e) = surface_context.make_current(dc.device) {
-            log::error!("unable to make the surface OpengL context current: {e}",);
-            return Err(crate::SurfaceError::Other(
-                "unable to make the surface OpengL context current",
-            ));
-        }
+            let framebuffer = unsafe { gl.create_framebuffer() }.map_err(|error| {
+                log::error!("Internal swapchain framebuffer creation failed: {error}");
+                crate::DeviceError::OutOfMemory
+            })?;
+            unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer)) };
+            unsafe {
+                gl.framebuffer_renderbuffer(
+                    glow::READ_FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::RENDERBUFFER,
+                    Some(renderbuffer),
+                )
+            };
+            unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, None) };
+            unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
 
+            (framebuffer, renderbuffer, None)
+        } else {
+            log::info!("cannot share context: {can_share_context:?}");
+
+            if let Err(e) = inner.context.make_current(inner.device) {
+                log::error!("unable to make the shared OpenGL context current: {e}",);
+                return Err(crate::SurfaceError::Other(
+                    "unable to make the shared OpenGL context current",
+                ));
+            }
+
+            let gl = &inner.gl;
+            let renderbuffer = unsafe { gl.create_renderbuffer() }.map_err(|error| {
+                log::error!("Internal swapchain renderbuffer creation failed: {error}");
+                crate::DeviceError::OutOfMemory
+            })?;
+            unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, Some(renderbuffer)) };
+            unsafe {
+                gl.renderbuffer_storage(
+                    glow::RENDERBUFFER,
+                    format_desc.internal,
+                    config.extent.width as _,
+                    config.extent.height as _,
+                )
+            };
+
+            // Create the swap chain OpenGL context
+
+            let context = unsafe { wglCreateContext(dc.device) };
+            if context.is_null() {
+                log::error!(
+                    "unable to create surface OpenGL context: {}",
+                    Error::last_os_error()
+                );
+                return Err(crate::SurfaceError::Other(
+                    "unable to create surface OpenGL context",
+                ));
+            }
+            let surface_context = WglContext { context };
+
+            if unsafe { wglShareLists(inner.context.context, surface_context.context) } == FALSE {
+                log::error!(
+                    "unable to share objects between OpenGL contexts: {}",
+                    Error::last_os_error()
+                );
+                return Err(crate::SurfaceError::Other(
+                    "unable to share objects between OpenGL contexts",
+                ));
+            }
+
+            if let Err(e) = surface_context.make_current(dc.device) {
+                log::error!("unable to make the surface OpengL context current: {e}",);
+                return Err(crate::SurfaceError::Other(
+                    "unable to make the surface OpengL context current",
+                ));
+            }
+
+            let surface_gl = unsafe {
+                glow::Context::from_loader_function(|name| {
+                    load_gl_func(name, Some(inner.opengl_module))
+                })
+            };
+
+            // Check that the surface context OpenGL is new enough to support framebuffers.
+            let version = unsafe { gl.get_parameter_string(glow::VERSION) };
+            let version = super::Adapter::parse_full_version(&version);
+            match version {
+                Ok(version) => {
+                    if version < (3, 0) {
+                        log::error!(
+                            "surface context OpenGL version ({}.{}) too old",
+                            version.0,
+                            version.1
+                        );
+                        return Err(crate::SurfaceError::Other(
+                            "surface context OpenGL version too old",
+                        ));
+                    }
+                }
+                Err(e) => {
+                    log::error!("unable to parse surface context OpenGL version: {e}",);
+                    return Err(crate::SurfaceError::Other(
+                        "unable to parse surface context OpenGL version",
+                    ));
+                }
+            }
+
+            let framebuffer = unsafe { surface_gl.create_framebuffer() }.map_err(|error| {
+                log::error!("Internal swapchain framebuffer creation failed: {error}");
+                crate::DeviceError::OutOfMemory
+            })?;
+            unsafe { surface_gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer)) };
+            unsafe {
+                surface_gl.framebuffer_renderbuffer(
+                    glow::READ_FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::RENDERBUFFER,
+                    Some(renderbuffer),
+                )
+            };
+            unsafe { surface_gl.bind_renderbuffer(glow::RENDERBUFFER, None) };
+            unsafe { surface_gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
+
+            unsafe { surface_gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
+            unsafe { surface_gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer)) };
+
+            (
+                framebuffer,
+                renderbuffer,
+                Some(SurfaceContext {
+                    wgl_context: surface_context,
+                    gl: surface_gl,
+                }),
+            )
+        };
+
+        // Setup presentation mode
         let extra = Wgl::load_with(|name| load_gl_func(name, None));
         let extentions = extensions(&extra, dc.device);
         if !(extentions.contains("WGL_EXT_swap_control") && extra.SwapIntervalEXT.is_loaded()) {
@@ -673,58 +833,8 @@ impl crate::Surface<super::Api> for Surface {
             return Err(crate::SurfaceError::Other("unable to set swap interval"));
         }
 
-        let surface_gl = unsafe {
-            glow::Context::from_loader_function(|name| {
-                load_gl_func(name, Some(inner.opengl_module))
-            })
-        };
-
-        // Check that the surface context OpenGL is new enough to support framebuffers.
-        let version = unsafe { gl.get_parameter_string(glow::VERSION) };
-        let version = super::Adapter::parse_full_version(&version);
-        match version {
-            Ok(version) => {
-                if version < (3, 0) {
-                    log::error!(
-                        "surface context OpenGL version ({}.{}) too old",
-                        version.0,
-                        version.1
-                    );
-                    return Err(crate::SurfaceError::Other(
-                        "surface context OpenGL version too old",
-                    ));
-                }
-            }
-            Err(e) => {
-                log::error!("unable to parse surface context OpenGL version: {e}",);
-                return Err(crate::SurfaceError::Other(
-                    "unable to parse surface context OpenGL version",
-                ));
-            }
-        }
-
-        let framebuffer = unsafe { surface_gl.create_framebuffer() }.map_err(|error| {
-            log::error!("Internal swapchain framebuffer creation failed: {error}");
-            crate::DeviceError::OutOfMemory
-        })?;
-        unsafe { surface_gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer)) };
-        unsafe {
-            surface_gl.framebuffer_renderbuffer(
-                glow::READ_FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::RENDERBUFFER,
-                Some(renderbuffer),
-            )
-        };
-        unsafe { surface_gl.bind_renderbuffer(glow::RENDERBUFFER, None) };
-        unsafe { surface_gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
-
-        unsafe { surface_gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
-        unsafe { surface_gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer)) };
-
         self.swapchain = Some(Swapchain {
             surface_context,
-            surface_gl,
             renderbuffer,
             framebuffer,
             extent: config.extent,
