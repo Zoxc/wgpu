@@ -789,7 +789,7 @@ impl super::Adapter {
         })
     }
 
-    unsafe fn compile_shader(
+    pub unsafe fn compile_shader(
         source: &str,
         gl: &glow::Context,
         shader_type: u32,
